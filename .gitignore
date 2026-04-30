@@ -1,0 +1,5 @@
+.venv
+.hf_cache
+train_raw.parquet
+.env
+__pycache__

@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+torch
+torchvision
+torchaudio
+transformers
+accelerate
+evaluate
+scikit-learn
+pyarrow
+fastparquet
+pandas
+huggingface_hub
+tqdm
