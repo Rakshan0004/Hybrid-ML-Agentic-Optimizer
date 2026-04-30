@@ -13,3 +13,4 @@ fastparquet
 pandas
 huggingface_hub
 tqdm
+google-generativeai

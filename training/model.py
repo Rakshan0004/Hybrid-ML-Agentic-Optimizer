@@ -1,27 +1,33 @@
+import os
+os.environ["HF_HOME"] = "D:/Coding/resume-reviewer/.hf_cache"
+
 import torch
 import torch.nn as nn
-from transformers import LongformerModel, LongformerConfig, PreTrainedModel
+from transformers import LongformerModel, LongformerTokenizer
 
-class ResumeScorerModel(PreTrainedModel):
-    config_class = LongformerConfig
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.longformer = LongformerModel(config)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+class ResumeScorerModel(nn.Module):
+    """
+    Longformer-based regression model for resume-job description matching.
+    We load the base LongformerModel separately and add our own regression head,
+    avoiding the complexity of subclassing PreTrainedModel.
+    """
+    def __init__(self, model_name="allenai/longformer-base-4096"):
+        super().__init__()
+        self.longformer = LongformerModel.from_pretrained(model_name, use_safetensors=True)
+        hidden_size = self.longformer.config.hidden_size  # 768
+        
+        self.dropout = nn.Dropout(0.1)
         
         # Regression head
         self.regressor = nn.Sequential(
-            nn.Linear(config.hidden_size, 256),
+            nn.Linear(hidden_size, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
-            nn.Sigmoid() # Output 0-1 for normalized score
+            nn.Sigmoid()  # Output 0-1 for normalized score
         )
-        
-        self.init_weights()
 
     def forward(self, input_ids=None, attention_mask=None, global_attention_mask=None, labels=None):
         outputs = self.longformer(
@@ -43,12 +49,8 @@ class ResumeScorerModel(PreTrainedModel):
             
         return ((loss, logits) if loss is not None else logits)
 
-import os
-os.environ["HF_HOME"] = "D:/Coding/resume-reviewer/.hf_cache"
 
-def get_model_and_tokenizer():
-    from transformers import LongformerTokenizer
-    model_name = "allenai/longformer-base-4096"
+def get_model_and_tokenizer(model_name="allenai/longformer-base-4096"):
     tokenizer = LongformerTokenizer.from_pretrained(model_name)
-    model = ResumeScorerModel.from_pretrained(model_name, use_safetensors=True)
+    model = ResumeScorerModel(model_name)
     return model, tokenizer
