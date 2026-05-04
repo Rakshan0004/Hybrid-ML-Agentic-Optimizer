@@ -1,9 +1,9 @@
 import os
-os.environ["HF_HOME"] = "D:/Coding/resume-reviewer/.hf_cache"
+os.environ["HF_HOME"] = "./.hf_cache"
 
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-import pandas as pd
 from model import get_model_and_tokenizer
 import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -110,8 +110,8 @@ def train():
     patience = 2
     patience_counter = 0
     
-    # Use mixed precision for GPU
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    # Disable mixed precision for GPU as it crashes Longformer on Windows
+    scaler = None
     
     for epoch in range(num_epochs):
         model.train()
@@ -154,7 +154,7 @@ def train():
                     optimizer.step()
                 optimizer.zero_grad()
             
-            if (step + 1) % 50 == 0:
+            if (step + 1) % 10 == 0 or step == 0:
                 print(f"  Epoch {epoch+1} | Step {step+1}/{len(train_loader)} | Loss: {loss.item() * accumulation_steps:.4f}")
         
         # Final gradient step if not aligned
@@ -192,7 +192,7 @@ def train():
         print()
     
     print(f"\nTraining complete! Best RMSE: {best_rmse:.4f}")
-    print(f"Model saved to ./models/final_model/")
+    print("Model saved to ./models/final_model/")
 
 
 if __name__ == "__main__":

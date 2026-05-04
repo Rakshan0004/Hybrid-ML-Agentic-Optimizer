@@ -1,5 +1,5 @@
 import os
-os.environ["HF_HOME"] = "D:/Coding/resume-reviewer/.hf_cache"
+os.environ["HF_HOME"] = "./.hf_cache"
 
 import torch
 import torch.nn as nn
