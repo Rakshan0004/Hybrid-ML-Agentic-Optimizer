@@ -1,15 +1,12 @@
 """
-Agent Orchestrator - Agentic loop using Gemini Function Calling.
-
-The LLM receives the user's message, the tool schemas, and decides which tools
-to call. Results stream back to the frontend via WebSocket.
+Agent Orchestrator - Universal support with fixed tool schemas for Google Gemini.
 """
 import os
 import json
-import abc
+import asyncio
 from typing import AsyncGenerator, Optional
+from openai import OpenAI
 import google.generativeai as genai
-from google.generativeai.types import content_types
 
 from .tools import (
     LatexDocument, TOOL_SCHEMAS,
@@ -17,183 +14,173 @@ from .tools import (
     extract_text_from_latex, score_resume
 )
 
-
 class AgentOrchestrator:
     """
     Orchestrates the agentic resume improvement loop.
-    Uses Gemini function calling so the LLM decides which tools to invoke.
     """
     def __init__(self, api_key: str, ml_model=None, ml_tokenizer=None):
-        genai.configure(api_key=api_key)
-        
-        # Convert our tool schemas to Gemini-compatible format
-        self.tools = genai.protos.Tool(
-            function_declarations=[
-                genai.protos.FunctionDeclaration(
-                    name=s["name"],
-                    description=s["description"],
-                    parameters=genai.protos.Schema(
-                        type=genai.protos.Type.OBJECT,
-                        properties={
-                            k: genai.protos.Schema(type=genai.protos.Type.STRING, description=v.get("description", ""))
-                            for k, v in s["parameters"].get("properties", {}).items()
-                        },
-                        required=s["parameters"].get("required", [])
-                    )
-                )
-                for s in TOOL_SCHEMAS
-            ]
-        )
-        
-        self.model = genai.GenerativeModel(
-            model_name='gemini-2.0-flash',
-            tools=[self.tools],
-            system_instruction=SYSTEM_PROMPT,
-        )
-        
+        self.api_key = api_key.strip()
+        self.provider = "openai" # default
         self.ml_model = ml_model
         self.ml_tokenizer = ml_tokenizer
         self.doc: Optional[LatexDocument] = None
         self.job_description: str = ""
-        self.chat = None  # Will hold a multi-turn chat session
-    
+        self.history = []
+
+        if self.api_key.startswith("AIza"):
+            self.provider = "google"
+            genai.configure(api_key=self.api_key)
+            # For Google, we use the manual declarations to avoid Pydantic schema errors
+            self.model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash-latest",
+                system_instruction=SYSTEM_PROMPT,
+                tools=self._get_google_tools()
+            )
+        elif self.api_key.startswith("sk-or-v1"):
+            self.provider = "openrouter"
+            self.client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=self.api_key,
+                default_headers={"HTTP-Referer": "http://localhost:3000", "X-Title": "JobFit Agent"}
+            )
+            self.model_name = "meta-llama/llama-3.1-8b-instruct:free"
+        else:
+            self.provider = "openai"
+            self.client = OpenAI(api_key=self.api_key)
+            self.model_name = "gpt-4o-mini"
+
+        # Pre-format tools for OpenAI-compatible providers
+        self.openai_tools = [
+            {"type": "function", "function": {"name": s["name"], "description": s["description"], "parameters": s["parameters"]}}
+            for s in TOOL_SCHEMAS
+        ]
+
+    def _get_google_tools(self):
+        """Manually define tool declarations for Google to avoid Pydantic issues."""
+        return [
+            {
+                "function_declarations": [
+                    {
+                        "name": s["name"],
+                        "description": s["description"],
+                        "parameters": s["parameters"]
+                    } for s in TOOL_SCHEMAS
+                ]
+            }
+        ]
+
     def start_session(self, latex_code: str, job_description: str):
-        """Initialize a new improvement session with the user's resume and JD."""
+        """Initialize a new improvement session."""
         self.doc = LatexDocument(latex_code)
         self.job_description = job_description
         
-        # Prime the chat with context about this session so it persists in history
-        self.chat = self.model.start_chat(
-            enable_automatic_function_calling=False,
-            history=[
-                {"role": "user", "parts": [f"""I need help improving my LaTeX resume for a specific job. Here is the job description I'm targeting:\n\n{job_description}\n\nI have uploaded my LaTeX resume. Use the read_latex tool to see it, and score_resume to get the baseline score. Then help me improve it based on my instructions."""]},
-                {"role": "model", "parts": ["I understand! I have the job description. I'll use my tools to read your resume, score it, and then help you improve it. What would you like me to do?"]}
-            ]
-        )
-    
-    def _execute_tool(self, function_call) -> str:
-        """Execute a tool call from the LLM and return the result."""
-        name = function_call.name
-        args = {k: v for k, v in function_call.args.items()}
-        
-        if name == "read_latex":
-            return read_latex(self.doc)
-        elif name == "edit_latex":
-            return edit_latex(self.doc, args["new_content"])
-        elif name == "edit_latex_section":
-            return edit_latex_section(self.doc, args["old_text"], args["new_text"])
-        elif name == "score_resume":
-            resume_text = extract_text_from_latex(self.doc.get_content())
-            result = score_resume(resume_text, self.job_description, self.ml_model, self.ml_tokenizer)
-            return json.dumps(result)
+        if self.provider == "google":
+            self.chat = self.model.start_chat(history=[])
         else:
+            system_content = SYSTEM_PROMPT.replace("{{JD}}", job_description)
+            self.history = [{"role": "system", "content": system_content}]
+
+    def _execute_tool(self, name: str, args: dict) -> str:
+        """Execute a tool call and return the result."""
+        try:
+            if name == "read_latex":
+                return read_latex(self.doc)
+            elif name == "edit_latex":
+                return edit_latex(self.doc, args.get("new_content", ""))
+            elif name == "edit_latex_section":
+                return edit_latex_section(self.doc, args.get("old_text", ""), args.get("new_text", ""))
+            elif name == "score_resume":
+                resume_text = extract_text_from_latex(self.doc.get_content())
+                result = score_resume(resume_text, self.job_description, self.ml_model, self.ml_tokenizer)
+                return json.dumps(result)
             return f"Unknown tool: {name}"
-    
+        except Exception as e:
+            return f"Tool Execution Error: {str(e)}"
+
     async def process_message(self, user_message: str) -> AsyncGenerator[dict, None]:
-        """
-        Process a user message through the agentic loop.
-        Yields events that the WebSocket sends to the frontend:
-          - {"type": "thinking", "content": "..."}
-          - {"type": "tool_call", "tool": "...", "args": {...}}
-          - {"type": "tool_result", "tool": "...", "result": "..."}
-          - {"type": "latex_update", "content": "..."} 
-          - {"type": "message", "content": "..."}
-          - {"type": "done"}
-        """
-        if not self.chat or not self.doc:
-            yield {"type": "error", "content": "Session not initialized. Send latex_code and job_description first."}
+        print(f"DEBUG: Received message from user: {user_message}")
+        if not self.doc:
+            yield {"type": "error", "content": "Session not initialized."}
             return
         
-        yield {"type": "thinking", "content": "Processing your request..."}
-        
-        # Send user message to Gemini (chat history automatically accumulates)
-        response = self.chat.send_message(user_message)
-        
-        # Agentic loop: keep going while the model wants to call tools
-        max_iterations = 15  # Safety limit
-        iteration = 0
-        
-        while iteration < max_iterations:
-            iteration += 1
-            
-            # Check if the model wants to call a function
-            part = response.candidates[0].content.parts[0]
-            
-            if hasattr(part, 'function_call') and part.function_call.name:
-                fc = part.function_call
-                
-                # Notify frontend about the tool call
-                yield {
-                    "type": "tool_call",
-                    "tool": fc.name,
-                    "args": dict(fc.args)
-                }
-                
-                # Execute the tool
-                result = self._execute_tool(fc)
-                
-                # Notify frontend about the result
-                yield {
-                    "type": "tool_result",
-                    "tool": fc.name,
-                    "result": result[:500] if len(result) > 500 else result  # Truncate for display
-                }
-                
-                # If a latex edit was made, send the updated content to frontend
-                if fc.name in ("edit_latex", "edit_latex_section"):
-                    yield {
-                        "type": "latex_update",
-                        "content": self.doc.get_content()
-                    }
-                
-                # Send the function result back to Gemini so it can continue
-                response = self.chat.send_message(
-                    genai.protos.Content(
-                        parts=[genai.protos.Part(
-                            function_response=genai.protos.FunctionResponse(
-                                name=fc.name,
-                                response={"result": result}
-                            )
-                        )]
-                    )
-                )
+        yield {"type": "thinking", "content": "Agent is thinking..."}
+
+        try:
+            if self.provider == "google":
+                async for chunk in self._process_google(user_message):
+                    yield chunk
             else:
-                # Model returned a text response (done with tools)
-                text = part.text if hasattr(part, 'text') else str(part)
-                yield {"type": "message", "content": text}
-                break
+                async for chunk in self._process_openai_compatible(user_message):
+                    yield chunk
+        except Exception as e:
+            print(f"DEBUG: CRITICAL ERROR in process_message: {str(e)}")
+            yield {"type": "error", "content": f"System Error: {str(e)}"}
         
         yield {"type": "done"}
 
+    async def _process_google(self, user_message: str) -> AsyncGenerator[dict, None]:
+        """Process using Google Generative AI SDK (Async)."""
+        response = await self.chat.send_message_async(user_message)
+        
+        for _ in range(12):
+            if response.candidates[0].content.parts:
+                tool_calls = [p.function_call for p in response.candidates[0].content.parts if p.function_call]
+                text_parts = [p.text for p in response.candidates[0].content.parts if p.text]
+                
+                if text_parts:
+                    yield {"type": "message", "content": " ".join(text_parts)}
 
-# ──────────────────────────────────────────────
-# System Prompt
-# ──────────────────────────────────────────────
+                if not tool_calls:
+                    break
 
-SYSTEM_PROMPT = """You are JobFit Agent — an expert AI resume optimizer. You help users improve their LaTeX resumes to better match specific job descriptions.
+                tool_responses = []
+                for tc in tool_calls:
+                    yield {"type": "tool_call", "tool": tc.name, "args": dict(tc.args)}
+                    result = self._execute_tool(tc.name, dict(tc.args))
+                    yield {"type": "tool_result", "tool": tc.name, "result": result[:300]}
+                    
+                    if tc.name in ("edit_latex", "edit_latex_section"):
+                        yield {"type": "latex_update", "content": self.doc.get_content()}
+                    
+                    tool_responses.append(genai.types.Part.from_function_response(name=tc.name, response={"result": result}))
+                
+                response = await self.chat.send_message_async(tool_responses)
+            else:
+                break
 
-## Your Capabilities
-You have access to these tools:
-1. **read_latex** — Read the current LaTeX resume source code
-2. **edit_latex_section** — Make targeted edits by replacing specific text sections
-3. **edit_latex** — Rewrite the entire document (use sparingly)
-4. **score_resume** — Score the current resume against the job description (0-100%)
+    async def _process_openai_compatible(self, user_message: str) -> AsyncGenerator[dict, None]:
+        """Process using OpenAI-compatible client."""
+        self.history.append({"role": "user", "content": user_message})
+        for _ in range(10):
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, lambda: self.client.chat.completions.create(
+                model=self.model_name, messages=self.history, tools=self.openai_tools
+            ))
+            
+            msg = resp.choices[0].message
+            self.history.append(msg)
+            
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    name = tc.function.name
+                    args = json.loads(tc.function.arguments)
+                    yield {"type": "tool_call", "tool": name, "args": args}
+                    result = self._execute_tool(name, args)
+                    yield {"type": "tool_result", "tool": name, "result": result[:300]}
+                    if name in ("edit_latex", "edit_latex_section"):
+                        yield {"type": "latex_update", "content": self.doc.get_content()}
+                    self.history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                continue
+            else:
+                yield {"type": "message", "content": msg.content or ""}
+                break
 
-## Your Workflow
-When asked to improve a resume:
-1. First, use `read_latex` to understand the current resume
-2. Use `score_resume` to get the baseline score
-3. Analyze the gap between current score and target
-4. Make targeted edits using `edit_latex_section` to improve keyword alignment, bullet points, and skills
-5. After each significant change, use `score_resume` to check progress
-6. Continue until the target score is reached or no more improvements can be made
+SYSTEM_PROMPT = """You are JobFit Agent — a professional AI resume consultant. 
 
-## Rules
-- NEVER fabricate experiences, degrees, certifications, or skills that aren't in the original resume
-- You CAN rephrase, reorganize, and optimize wording
-- You CAN reorder skills to prioritize those matching the JD
-- You CAN improve bullet points to use the STAR framework with quantifiable metrics (if the data exists)
-- You CAN add keywords from the JD into the summary/objective section IF they relate to existing skills
-- Always maintain valid LaTeX syntax
-- Explain each change you make and why
+## Your Approach
+- You are polite and reactive. If the user says "hi", greet them back.
+- Do NOT start editing until the user asks you to start or gives a specific instruction.
+- When asked to improve, use `read_latex` and `score_resume` first.
+- Targeted edits only via `edit_latex_section`.
+- Maintain valid LaTeX.
 """

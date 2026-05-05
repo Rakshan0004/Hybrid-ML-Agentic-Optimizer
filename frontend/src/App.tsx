@@ -1,48 +1,36 @@
-import { useState, useRef, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
-// Types for WebSocket events
-interface AgentEvent {
-  type: 'thinking' | 'tool_call' | 'tool_result' | 'latex_update' | 'message' | 'done' | 'error' | 'system';
-  content?: string;
-  tool?: string;
-  args?: Record<string, string>;
-  result?: string;
-}
-
-interface ChatMessage {
+interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
-  toolName?: string;
-  toolArgs?: Record<string, string>;
 }
 
-function App() {
-  // ── Input State ──
+export default function App() {
+  // --- Inputs ---
   const [resumeLatex, setResumeLatex] = useState('');
   const [jobDescription, setJobDescription] = useState('');
   
-  // ── Session State ──
-  const [sessionActive, setSessionActive] = useState(false);
-  const [currentLatex, setCurrentLatex] = useState('');
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState('');
-  const [isAgentWorking, setIsAgentWorking] = useState(false);
-  
-  // ── Score State ──
+  // --- State ---
   const [score, setScore] = useState<number | null>(null);
   const [scoreLoading, setScoreLoading] = useState(false);
+  const [sessionActive, setSessionActive] = useState(false);
+  const [launchLoading, setLaunchLoading] = useState(false);
   
-  // ── WebSocket ──
-  const wsRef = useRef<WebSocket | null>(null);
+  // --- Agent Chat ---
+  const [chatMessages, setChatMessages] = useState<Message[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isAgentWorking, setIsAgentWorking] = useState(false);
+  const [currentLatex, setCurrentLatex] = useState('');
+  const [ws, setWs] = useState<WebSocket | null>(null);
+
   const chatEndRef = useRef<HTMLDivElement>(null);
-  
-  // Auto-scroll chat to bottom
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // ── Quick Score (no agent, just API call) ──
   const handleScore = async () => {
+    if (!resumeLatex || !jobDescription) return;
     setScoreLoading(true);
     try {
       const response = await fetch('http://localhost:8000/score', {
@@ -51,325 +39,272 @@ function App() {
         body: JSON.stringify({ resume_text: resumeLatex, job_description: jobDescription }),
       });
       const data = await response.json();
-      if (response.ok) {
-        setScore(data.confidence_score);
-      } else {
-        alert(data.detail || 'Error scoring resume');
-      }
-    } catch {
-      alert('Failed to connect to API. Is the backend running?');
+      setScore(data.confidence_score);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to get score. Is the backend running?');
+    } finally {
+      setScoreLoading(false);
     }
-    setScoreLoading(false);
   };
 
-  // ── Start Agent Session ──
   const startSession = () => {
-    if (!resumeLatex || !jobDescription) {
-      alert('Please paste both your LaTeX resume and the job description.');
-      return;
-    }
+    if (!resumeLatex || !jobDescription) return;
+    if (ws) ws.close(); // Close existing if any
 
-    const ws = new WebSocket('ws://localhost:8000/ws/agent');
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      // Send init message with resume and JD
-      ws.send(JSON.stringify({
+    setLaunchLoading(true);
+    setChatMessages([]);
+    setCurrentLatex(resumeLatex);
+    
+    const socket = new WebSocket('ws://localhost:8000/ws/agent');
+    
+    socket.onopen = () => {
+      socket.send(JSON.stringify({
         type: 'init',
         latex_code: resumeLatex,
         job_description: jobDescription,
       }));
       setSessionActive(true);
-      setCurrentLatex(resumeLatex);
-      setChatMessages([]);
+      setLaunchLoading(false);
     };
 
-    ws.onmessage = (event) => {
-      const data: AgentEvent = JSON.parse(event.data);
-      
+    socket.onmessage = (event) => {
+      const data = JSON.parse(event.data);
       switch (data.type) {
         case 'system':
-          setChatMessages(prev => [...prev, { role: 'system', content: data.content || '' }]);
+          setChatMessages(prev => [...prev, { role: 'system', content: data.content }]);
           break;
-          
-        case 'thinking':
-          setChatMessages(prev => [...prev, { role: 'assistant', content: `💭 ${data.content}` }]);
-          break;
-          
-        case 'tool_call':
-          setChatMessages(prev => [...prev, { 
-            role: 'tool', 
-            content: `🔧 Calling \`${data.tool}\``,
-            toolName: data.tool,
-            toolArgs: data.args
-          }]);
-          break;
-          
-        case 'tool_result':
-          setChatMessages(prev => [...prev, { 
-            role: 'tool', 
-            content: `✅ ${data.tool} result: ${data.result}` 
-          }]);
-          break;
-          
-        case 'latex_update':
-          setCurrentLatex(data.content || '');
-          setChatMessages(prev => [...prev, { role: 'system', content: '📝 LaTeX document updated!' }]);
-          break;
-          
         case 'message':
-          setChatMessages(prev => [...prev, { role: 'assistant', content: data.content || '' }]);
+          setChatMessages(prev => [...prev, { role: 'assistant', content: data.content }]);
           setIsAgentWorking(false);
           break;
-          
+        case 'thinking':
+          setIsAgentWorking(true);
+          break;
+        case 'tool_call':
+          setChatMessages(prev => [...prev, { role: 'tool', content: `🛠️ ${data.tool}...` }]);
+          break;
+        case 'latex_update':
+          setCurrentLatex(data.content);
+          setResumeLatex(data.content); // Sync back to input
+          break;
         case 'error':
           setChatMessages(prev => [...prev, { role: 'system', content: `❌ Error: ${data.content}` }]);
           setIsAgentWorking(false);
+          setLaunchLoading(false);
           break;
-          
         case 'done':
           setIsAgentWorking(false);
           break;
       }
     };
 
-    ws.onerror = () => {
-      alert('WebSocket error. Is the backend running?');
+    socket.onclose = () => {
       setIsAgentWorking(false);
+      setLaunchLoading(false);
     };
 
-    ws.onclose = () => {
-      setSessionActive(false);
-      setIsAgentWorking(false);
+    socket.onerror = () => {
+      setLaunchLoading(false);
+      alert('WebSocket connection failed.');
     };
+
+    setWs(socket);
   };
 
-  // ── Send Chat Message ──
   const sendMessage = () => {
-    if (!chatInput.trim() || !wsRef.current || isAgentWorking) return;
-    
-    const message = chatInput.trim();
-    setChatMessages(prev => [...prev, { role: 'user', content: message }]);
+    if (!chatInput.trim() || !ws) return;
+    const userMsg = chatInput.trim();
+    setChatMessages(prev => [...prev, { role: 'user', content: userMsg }]);
+    ws.send(JSON.stringify({ type: 'message', content: userMsg }));
     setChatInput('');
     setIsAgentWorking(true);
-    
-    wsRef.current.send(JSON.stringify({
-      type: 'message',
-      content: message,
-    }));
   };
 
-  // ── Disconnect Session ──
-  const endSession = () => {
-    wsRef.current?.close();
+  const resetSession = () => {
+    ws?.close();
+    setWs(null);
     setSessionActive(false);
+    setChatMessages([]);
+    setScore(null);
   };
 
-  // ──────────────────────────────────────────
-  // RENDER
-  // ──────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-[#0a0a1a] text-white font-sans">
+    <div className="h-screen flex flex-col bg-[#03030a] text-white overflow-hidden font-sans">
       {/* Header */}
-      <header className="border-b border-gray-800 bg-[#0d0d20]/80 backdrop-blur-lg sticky top-0 z-50">
-        <div className="max-w-[1600px] mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center font-bold text-lg">J</div>
-            <div>
-              <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-400">JobFit Agent</h1>
-              <p className="text-xs text-gray-500">AI-Powered Resume Optimizer</p>
-            </div>
+      <header className="h-14 flex-shrink-0 border-b border-white/5 bg-black/40 backdrop-blur-md flex items-center px-6 justify-between z-50">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center font-bold text-lg shadow-lg">
+            <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
           </div>
+          <div>
+            <h1 className="text-sm font-bold tracking-tight">JobFit AI Dashboard</h1>
+            <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">v1.0 Production</p>
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-4">
           {score !== null && (
-            <div className="flex items-center gap-3 bg-gray-800/50 px-4 py-2 rounded-full border border-gray-700">
-              <span className="text-sm text-gray-400">Match Score:</span>
-              <span className={`text-lg font-bold ${score > 70 ? 'text-green-400' : score > 40 ? 'text-yellow-400' : 'text-red-400'}`}>
+            <div className="flex items-center gap-3 glass-panel px-4 py-1 rounded-full border-white/10">
+              <span className="text-[9px] font-bold text-gray-500 uppercase tracking-widest">Match Score</span>
+              <span className={`text-sm font-black ${score > 70 ? 'text-green-400' : score > 40 ? 'text-yellow-400' : 'text-red-400'}`}>
                 {score.toFixed(1)}%
               </span>
             </div>
           )}
+          {sessionActive && (
+            <button onClick={resetSession} className="text-[9px] font-bold text-red-400 border border-red-400/20 px-3 py-1 rounded-md hover:bg-red-400/10 transition-all">
+              RESET DASHBOARD
+            </button>
+          )}
         </div>
       </header>
 
-      {!sessionActive ? (
-        /* ──────── SETUP VIEW ──────── */
-        <div className="max-w-5xl mx-auto px-6 py-12">
-          <div className="text-center mb-12">
-            <h2 className="text-3xl font-bold mb-3">Get Started</h2>
-            <p className="text-gray-400">Paste your LaTeX resume and the target job description to begin.</p>
+      {/* Main Dashboard Layout */}
+      <main className="flex-1 flex overflow-hidden relative">
+        {/* Background Effects */}
+        <div className="absolute top-[-10%] left-[-10%] w-[30%] h-[30%] bg-purple-600/5 rounded-full blur-[100px] pointer-events-none"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[30%] h-[30%] bg-blue-600/5 rounded-full blur-[100px] pointer-events-none"></div>
+
+        {/* --- COLUMN 1: INPUTS (25%) --- */}
+        <div className="w-[350px] flex-shrink-0 border-r border-white/5 flex flex-col bg-black/10">
+          <div className="p-4 border-b border-white/5 bg-white/5 flex items-center justify-between">
+            <h3 className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Context & JD</h3>
           </div>
-          
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar">
             <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-purple-500"></span>
-                LaTeX Resume Code
-              </label>
+              <label className="text-[9px] font-bold text-gray-500 uppercase tracking-widest">Target Job Description</label>
               <textarea 
-                className="w-full h-72 bg-[#12122a] border border-gray-700/50 rounded-xl p-4 text-gray-300 focus:ring-2 focus:ring-purple-500/50 focus:border-purple-500/50 focus:outline-none font-mono text-sm resize-none transition-all"
-                placeholder={"\\documentclass{article}\n\\begin{document}\n  % Your resume here...\n\\end{document}"}
-                value={resumeLatex}
-                onChange={(e) => setResumeLatex(e.target.value)}
-              />
-            </div>
-            
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-blue-500"></span>
-                Job Description
-              </label>
-              <textarea 
-                className="w-full h-72 bg-[#12122a] border border-gray-700/50 rounded-xl p-4 text-gray-300 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 focus:outline-none text-sm resize-none transition-all"
-                placeholder="Paste the full job description here..."
+                className="w-full h-48 glass-panel glass-input rounded-xl p-3 text-xs text-gray-300 resize-none focus:h-80 transition-all duration-300"
+                placeholder="Paste JD here..."
                 value={jobDescription}
                 onChange={(e) => setJobDescription(e.target.value)}
               />
             </div>
-          </div>
-
-          <div className="flex gap-4 mt-8 justify-center">
-            <button 
-              onClick={handleScore}
-              disabled={scoreLoading || !resumeLatex || !jobDescription}
-              className="px-8 py-3 bg-gray-800 hover:bg-gray-700 border border-gray-600 rounded-xl font-medium transition disabled:opacity-40"
-            >
-              {scoreLoading ? '⏳ Scoring...' : '📊 Quick Score'}
-            </button>
-            <button 
-              onClick={startSession}
-              disabled={!resumeLatex || !jobDescription}
-              className="px-8 py-3 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 rounded-xl font-bold shadow-lg shadow-purple-500/20 transition transform active:scale-95 disabled:opacity-40"
-            >
-              🚀 Start AI Agent Session
-            </button>
-          </div>
-
-          {score !== null && (
-            <div className="mt-8 text-center">
-              <div className="inline-flex items-center gap-4 bg-gray-800/50 px-8 py-4 rounded-2xl border border-gray-700">
-                <div className="relative w-20 h-20">
-                  <svg className="w-full h-full transform -rotate-90">
-                    <circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="6" fill="transparent" className="text-gray-700" />
-                    <circle cx="40" cy="40" r="34" stroke="currentColor" strokeWidth="6" fill="transparent"
-                      strokeDasharray={2 * Math.PI * 34}
-                      strokeDashoffset={2 * Math.PI * 34 * (1 - score / 100)}
-                      className={`${score > 70 ? 'text-green-500' : score > 40 ? 'text-yellow-500' : 'text-red-500'} transition-all duration-1000`}
-                    />
-                  </svg>
-                  <span className="absolute inset-0 flex items-center justify-center text-lg font-bold">{score.toFixed(0)}%</span>
-                </div>
-                <div className="text-left">
-                  <p className="font-semibold">{score > 70 ? 'Strong Match' : score > 40 ? 'Moderate Match' : 'Needs Work'}</p>
-                  <p className="text-sm text-gray-400">Start an agent session to improve it!</p>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      ) : (
-        /* ──────── AGENT SESSION VIEW ──────── */
-        <div className="flex h-[calc(100vh-73px)]">
-          {/* Left Panel: Chat */}
-          <div className="w-1/2 flex flex-col border-r border-gray-800">
-            <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between bg-[#0d0d20]/50">
-              <div className="flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${isAgentWorking ? 'bg-yellow-400 animate-pulse' : 'bg-green-400'}`}></div>
-                <span className="text-sm font-medium text-gray-300">
-                  {isAgentWorking ? 'Agent is working...' : 'Agent Ready'}
-                </span>
-              </div>
-              <button onClick={endSession} className="text-xs text-red-400 hover:text-red-300 transition">
-                End Session
+            
+            <div className="pt-4 border-t border-white/5 space-y-4">
+              <button 
+                onClick={handleScore} 
+                disabled={scoreLoading || !resumeLatex || !jobDescription}
+                className="w-full py-2.5 glass-panel rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/5 transition-all"
+              >
+                {scoreLoading ? 'Scoring...' : '📊 Calculate Score'}
               </button>
+              
+              {!sessionActive && (
+                <button 
+                  onClick={startSession} 
+                  disabled={launchLoading || !resumeLatex || !jobDescription}
+                  className="w-full py-3 bg-gradient-to-r from-blue-600 to-purple-600 rounded-xl text-[10px] font-bold uppercase tracking-widest shadow-xl hover:brightness-110 active:scale-95 transition-all"
+                >
+                  {launchLoading ? '⌛ Initializing...' : '🚀 Launch AI Agent'}
+                </button>
+              )}
             </div>
 
-            {/* Chat Messages */}
-            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-              {chatMessages.map((msg, i) => (
+            {score !== null && (
+              <div className="glass-panel p-4 rounded-xl border-white/10 text-center animate-in zoom-in-95 duration-500">
+                <div className="text-3xl font-black mb-1">{score.toFixed(0)}%</div>
+                <div className="text-[10px] font-bold uppercase tracking-widest text-gray-500">ATS Compatibility</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* --- COLUMN 2: AGENT CHAT (35%) --- */}
+        <div className="w-[450px] flex-shrink-0 border-r border-white/5 flex flex-col bg-black/20">
+          <div className="h-12 border-b border-white/5 flex items-center justify-between px-4 bg-white/5">
+            <div className="flex items-center gap-2">
+              <div className={`w-1.5 h-1.5 rounded-full ${isAgentWorking ? 'bg-purple-500 animate-pulse' : 'bg-green-500'}`}></div>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-gray-400">AI Assistant {isAgentWorking ? '(Thinking)' : '(Ready)'}</span>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+            {!sessionActive ? (
+              <div className="h-full flex flex-col items-center justify-center text-center px-6 space-y-4 opacity-40">
+                <div className="w-12 h-12 rounded-full border-2 border-dashed border-gray-600 flex items-center justify-center">
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path></svg>
+                </div>
+                <p className="text-xs italic">Launch the AI Agent to start the conversation and optimize your resume.</p>
+              </div>
+            ) : (
+              chatMessages.map((msg, i) => (
                 <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[85%] rounded-xl px-4 py-2.5 text-sm whitespace-pre-wrap ${
-                    msg.role === 'user' 
-                      ? 'bg-blue-600/30 border border-blue-500/30 text-blue-100' 
-                      : msg.role === 'tool'
-                      ? 'bg-amber-900/20 border border-amber-700/30 text-amber-200 font-mono text-xs'
-                      : msg.role === 'system'
-                      ? 'bg-gray-800/50 border border-gray-700/30 text-gray-400 text-xs'
-                      : 'bg-gray-800/60 border border-gray-700/40 text-gray-200'
+                  <div className={`max-w-[90%] rounded-xl px-3.5 py-2 text-xs leading-relaxed ${
+                    msg.role === 'user' ? 'bg-blue-600 text-white' : 
+                    msg.role === 'tool' ? 'bg-white/5 text-blue-300 font-mono text-[9px] border border-blue-400/20' :
+                    msg.role === 'system' ? 'text-gray-500 text-[10px] italic w-full text-center' : 'glass-panel text-gray-200'
                   }`}>
                     {msg.content}
                   </div>
                 </div>
-              ))}
-              {isAgentWorking && (
-                <div className="flex justify-start">
-                  <div className="bg-gray-800/60 border border-gray-700/40 rounded-xl px-4 py-3 text-sm text-gray-400">
-                    <span className="inline-flex gap-1">
-                      <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '0ms'}}></span>
-                      <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></span>
-                      <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></span>
-                    </span>
-                  </div>
+              ))
+            )}
+            {isAgentWorking && (
+              <div className="flex justify-start">
+                <div className="glass-panel px-3 py-1.5 rounded-lg flex gap-1 items-center">
+                  <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce"></span>
+                  <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce [animation-delay:0.2s]"></span>
+                  <span className="w-1 h-1 bg-purple-400 rounded-full animate-bounce [animation-delay:0.4s]"></span>
                 </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            {/* Chat Input */}
-            <div className="px-4 py-3 border-t border-gray-800 bg-[#0d0d20]/50">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
-                  placeholder="e.g. 'Improve my resume to 90%' or 'Optimize the skills section'"
-                  disabled={isAgentWorking}
-                  className="flex-1 bg-[#12122a] border border-gray-700/50 rounded-xl px-4 py-3 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 disabled:opacity-50"
-                />
-                <button
-                  onClick={sendMessage}
-                  disabled={isAgentWorking || !chatInput.trim()}
-                  className="px-5 py-3 bg-gradient-to-r from-blue-600 to-purple-600 rounded-xl font-medium text-sm transition active:scale-95 disabled:opacity-40"
-                >
-                  Send
-                </button>
               </div>
-              <div className="flex gap-2 mt-2">
-                {['Improve to 90%', 'Optimize skills section', 'Score my resume', 'Rewrite summary'].map(q => (
-                  <button 
-                    key={q}
-                    onClick={() => { setChatInput(q); }}
-                    className="text-xs px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg text-gray-400 transition"
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
-            </div>
+            )}
+            <div ref={chatEndRef} />
           </div>
 
-          {/* Right Panel: Live LaTeX Viewer */}
-          <div className="w-1/2 flex flex-col">
-            <div className="px-4 py-3 border-b border-gray-800 bg-[#0d0d20]/50 flex items-center justify-between">
-              <span className="text-sm font-medium text-gray-300 flex items-center gap-2">
-                <span className="w-2 h-2 rounded-full bg-green-400"></span>
-                Live LaTeX Preview
-              </span>
+          <div className="p-4 bg-white/5 border-t border-white/5">
+            <div className={`flex gap-2 bg-black/40 p-1.5 rounded-xl border ${sessionActive ? 'border-white/10' : 'border-white/5 opacity-30'} transition-all`}>
+              <input 
+                className="flex-1 bg-transparent px-3 py-2 text-xs focus:outline-none disabled:cursor-not-allowed"
+                placeholder={sessionActive ? "Ask the agent to improve..." : "Launch agent first..."}
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+                disabled={!sessionActive || isAgentWorking}
+              />
               <button 
-                onClick={() => navigator.clipboard.writeText(currentLatex)}
-                className="text-xs text-gray-400 hover:text-white transition px-3 py-1 border border-gray-700 rounded-lg"
+                onClick={sendMessage} 
+                disabled={!sessionActive || isAgentWorking || !chatInput.trim()}
+                className="bg-white text-black px-4 py-2 rounded-lg font-bold text-[10px] uppercase tracking-widest disabled:opacity-40"
               >
-                📋 Copy
+                Send
               </button>
             </div>
-            <pre className="flex-1 overflow-auto p-4 bg-[#0a0a18] text-gray-300 font-mono text-xs leading-relaxed whitespace-pre-wrap">
-              {currentLatex || 'LaTeX content will appear here once the session starts...'}
-            </pre>
           </div>
         </div>
-      )}
+
+        {/* --- COLUMN 3: LATEX EDITOR (FLEX-1) --- */}
+        <div className="flex-1 flex flex-col bg-[#020207]">
+          <div className="h-12 border-b border-white/5 flex items-center justify-between px-6 bg-white/5">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-gray-400">LaTeX Source Editor</span>
+            <div className="flex gap-4">
+              <button onClick={() => navigator.clipboard.writeText(currentLatex || resumeLatex)} className="text-[9px] font-bold text-gray-500 hover:text-white uppercase tracking-widest">Copy Code</button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-hidden relative">
+            <textarea 
+              className="absolute inset-0 w-full h-full bg-transparent p-8 text-gray-300 font-mono text-xs leading-relaxed resize-none focus:outline-none custom-scrollbar"
+              value={sessionActive ? currentLatex : resumeLatex}
+              onChange={(e) => {
+                if (sessionActive) {
+                   // In session, let the agent control it mainly, but allow user edit
+                   setCurrentLatex(e.target.value);
+                } else {
+                   setResumeLatex(e.target.value);
+                }
+              }}
+              placeholder="% Paste your LaTeX resume source code here..."
+            />
+          </div>
+          {/* Editor Footer */}
+          <div className="h-8 border-t border-white/5 flex items-center px-6 bg-black/40">
+             <span className="text-[8px] text-gray-600 uppercase font-bold tracking-widest">
+               {sessionActive ? 'Agentic Mode Active' : 'Waiting for Input'} | Chars: {(sessionActive ? currentLatex : resumeLatex).length}
+             </span>
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
-
-export default App;

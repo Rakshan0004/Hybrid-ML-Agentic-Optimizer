@@ -20,6 +20,8 @@ load_dotenv()  # Load .env file
 # Add project root to path so we can import training module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.tools import extract_text_from_latex
+
 app = FastAPI(title="JobFit Agent API")
 
 # Allow CORS for React dev server
@@ -73,7 +75,10 @@ async def score_resume_endpoint(request: ScoreRequest):
     if ml_model is None:
         raise HTTPException(status_code=503, detail="Model not trained yet. Run training/train.py first.")
     
-    text = f"{request.resume_text} {ml_tokenizer.sep_token} {request.job_description}"
+    # Strip LaTeX commands before scoring (model was trained on plain text)
+    clean_resume = extract_text_from_latex(request.resume_text)
+    
+    text = f"{clean_resume} {ml_tokenizer.sep_token} {request.job_description}"
     encoding = ml_tokenizer(
         text,
         max_length=4096,
@@ -99,9 +104,10 @@ async def agent_websocket(websocket: WebSocket):
     
     from agent.orchestrator import AgentOrchestrator
     
-    api_key = os.getenv("GEMINI_API_KEY", "")
+    # Prioritize Gemini key as it's the most reliable for the user
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        await websocket.send_json({"type": "error", "content": "GEMINI_API_KEY not set in .env file"})
+        await websocket.send_json({"type": "error", "content": "No API Key found in .env file (GEMINI_API_KEY or OPENROUTER_API_KEY)"})
         await websocket.close()
         return
     
@@ -146,8 +152,10 @@ async def agent_websocket(websocket: WebSocket):
                     continue
                 
                 # Stream agent events back to the frontend
-                async for event in orchestrator.process_message(user_message):
-                    await websocket.send_json(event)
+                print(f"DEBUG: Received message from user: {user_message}")
+                async for response in orchestrator.process_message(user_message):
+                    print(f"DEBUG: Sending response to frontend: {response['type']}")
+                    await websocket.send_json(response)
             
             else:
                 await websocket.send_json({"type": "error", "content": f"Unknown message type: {msg_type}"})
